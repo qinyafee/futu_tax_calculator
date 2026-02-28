@@ -1,3 +1,24 @@
+*2026-3*
+
+```bash
+# 步骤1: 自动执行stock.xlsx中的 证券-交易流水sheet 提取csv格式，保存到 data中，提取前删除 账户号码 这一列敏感信息
+python preprocess/extract_stock_trade_sheet.py
+
+
+# 步骤2: 计算税务并生成报告
+# 使用默认 data 目录（遍历其中所有 CSV）
+python tax/stock_option_tax_calculator.py
+
+# 指定其他目录
+python tax/stock_option_tax_calculator.py --input /path/to/csv_folder
+
+# 仍可指定单个文件
+python tax/stock_option_tax_calculator.py --input data/2024stock_证券-交易流水.csv
+
+# 步骤3: 查看生成的报告
+ls 税务报告/
+```
+
 *2025-12-29 号重要说明*
 
 富途终于在各大用户强烈呼声中已经提供 年度流水表格，包含激励授予股票

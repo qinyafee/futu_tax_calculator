@@ -29,7 +29,26 @@ DIRECTION_MAPPING = {
     'sell_short': 'sell',
     'buy_back': 'buy',
     'buy': 'buy',
-    'sell': 'sell'
+    'sell': 'sell',
+    # 做多交易
+    '买入开仓': 'buy',
+    '卖出平仓': 'sell',
+    '申购': 'buy',
+    '赎回': 'sell',
+    #做空交易
+    '卖出开仓': 'sell',
+    '买入平仓': 'buy',
+}
+
+# 证券-交易流水.csv 列名 -> 计算器内部列名
+COLUMN_NAME_MAPPING = {
+    '成交时间': '交易时间',
+    '数量/面值': '数量',
+    '价格': '成交价格',
+    '总费用': '合计手续费',
+    '方向': '买卖方向',
+    '代码名称': '股票代码',
+    '币种': '结算币种',
 }
 
 # 期权价格乘数
@@ -58,7 +77,7 @@ logger = _setup_logging()
 # ==============================================================================
 
 def preprocess_data(file_path: str) -> pd.DataFrame:
-    """加载并预处理交易数据。"""
+    """加载并预处理单个 CSV 交易数据。"""
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"输入文件未找到: {file_path}")
 
@@ -67,6 +86,11 @@ def preprocess_data(file_path: str) -> pd.DataFrame:
     except Exception as e:
         raise ValueError(f"读取CSV文件失败: {e}")
 
+    # 将证券-交易流水 CSV 列名统一为计算器内部列名
+    rename_map = {k: v for k, v in COLUMN_NAME_MAPPING.items() if k in df.columns}
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
     _validate_dataframe_columns(df)
     cleaned_df = _clean_trading_data(df)
 
@@ -74,6 +98,40 @@ def preprocess_data(file_path: str) -> pd.DataFrame:
         raise ValueError("处理后的数据为空，请检查输入文件的数据质量")
 
     return cleaned_df
+
+
+def load_transactions(input_path: str) -> pd.DataFrame:
+    """从文件或文件夹加载交易数据。为文件夹时遍历该目录下所有 CSV 并合并。"""
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"输入路径不存在: {input_path}")
+
+    if os.path.isfile(input_path):
+        return preprocess_data(input_path)
+
+    if not os.path.isdir(input_path):
+        raise ValueError(f"输入路径既非文件也非目录: {input_path}")
+
+    csv_files = sorted(
+        f for f in os.listdir(input_path)
+        if f.endswith('.csv') and f != 'futu_rsu_history.csv'
+    )
+    if not csv_files:
+        raise ValueError(f"目录下未找到 CSV 文件: {input_path}")
+
+    dfs: List[pd.DataFrame] = []
+    for name in csv_files:
+        path = os.path.join(input_path, name)
+        try:
+            dfs.append(preprocess_data(path))
+            logger.info("已加载: %s", name)
+        except (ValueError, FileNotFoundError) as e:
+            logger.warning("跳过 %s: %s", name, e)
+
+    if not dfs:
+        raise ValueError(f"目录下没有可用的交易 CSV: {input_path}")
+
+    merged = pd.concat(dfs, ignore_index=True)
+    return merged.sort_values(by='交易时间', ignore_index=True)
 
 def _validate_dataframe_columns(df: pd.DataFrame) -> None:
     """验证DataFrame是否包含必需的列。"""
@@ -364,14 +422,14 @@ def _merge_rsu_data(transactions_df: pd.DataFrame, input_dir: str) -> pd.DataFra
         logger.info("未检测到 RSU 历史文件，跳过合并步骤。")
     return transactions_df
 
-def calculate_tax(input_file: str, output_dir: str):
-    """重构后的主计算函数。"""
+def calculate_tax(input_path: str, output_dir: str):
+    """重构后的主计算函数。input_path 可为单个 CSV 文件或包含多个 CSV 的文件夹。"""
     try:
-        # 1. 加载主数据
-        transactions_df = preprocess_data(input_file)
+        # 1. 加载主数据（支持文件或文件夹，文件夹时遍历所有 CSV）
+        transactions_df = load_transactions(input_path)
 
-        # 2. (可选) 合并RSU数据
-        input_dir = os.path.dirname(input_file)
+        # 2. (可选) 合并RSU数据（从输入所在目录读取）
+        input_dir = input_path if os.path.isdir(input_path) else os.path.dirname(input_path)
         transactions_df = _merge_rsu_data(transactions_df, input_dir)
 
         # 3. 分类资产
@@ -394,10 +452,11 @@ def calculate_tax(input_file: str, output_dir: str):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='股票及期权年度报税计算器')
-    default_csv_path = os.path.join(os.path.dirname(__file__), '..', 'data', 'futu_history.csv')
+    default_input = os.path.join(os.path.dirname(__file__), '..', 'data')
     default_out_dir = os.path.join(os.path.dirname(__file__), '..', '税务报告')
 
-    parser.add_argument('--input', type=str, default=default_csv_path, help='输入的CSV文件路径')
+    parser.add_argument('--input', type=str, default=default_input,
+                        help='输入的 CSV 文件路径或包含多个 CSV 的文件夹（默认: data）')
     parser.add_argument('--output', type=str, default=default_out_dir, help='输出报告的文件夹路径')
     args = parser.parse_args()
 
