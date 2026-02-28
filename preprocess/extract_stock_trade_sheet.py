@@ -22,6 +22,10 @@ def extract_one(xlsx_path: Path, output_dir: Path) -> Path:
     if COLUMN_TO_DROP in df.columns:
         df = df.drop(columns=[COLUMN_TO_DROP])
 
+    # 数量/面值 列中如有负值，统一转为正数。应对卖出方向的负值
+    if "数量/面值" in df.columns:
+        df["数量/面值"] = df["数量/面值"].abs()
+
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / f"{xlsx_path.stem}_{SHEET_NAME}.csv"
     df.to_csv(out_path, index=False, encoding="utf-8-sig")

@@ -49,6 +49,7 @@ COLUMN_NAME_MAPPING = {
     '方向': '买卖方向',
     '代码名称': '股票代码',
     '币种': '结算币种',
+    '品类': '资产类型',
 }
 
 # 期权价格乘数
@@ -192,13 +193,21 @@ def create_sales_record(
 def extract_expiration_date(option_code: str) -> Optional[str]:
     """从期权代码中解析到期日。"""
     match = OPTION_PATTERN.match(option_code)
-    if not match:
+    date_token: Optional[str] = match.group(3) if match else None
+
+    # 兼容无 US./HK. 前缀的格式，例如: SPY241227P560000
+    if not date_token:
+        alt_pattern = re.compile(r'^(?P<symbol>[A-Z0-9]+)(?P<date>\d{6})(?P<cp>[CP])(?P<strike>\d+)$')
+        alt_match = alt_pattern.match(option_code)
+        date_token = alt_match.group('date') if alt_match else None
+
+    if not date_token:
         logger.warning(f"代码 '{option_code}' 不匹配期权格式，无法解析到期日。")
         return None
     try:
-        return datetime.strptime(match.group(3), '%y%m%d').strftime('%Y-%m-%d')
+        return datetime.strptime(date_token, '%y%m%d').strftime('%Y-%m-%d')
     except ValueError:
-        logger.warning(f"从'{option_code}'中解析的日期'{match.group(3)}'无效。")
+        logger.warning(f"从'{option_code}'中解析的日期'{date_token}'无效。")
         return None
 
 
@@ -352,9 +361,9 @@ def _process_all_transactions(df: pd.DataFrame) -> pd.DataFrame:
         asset_type = group_df['资产类型'].iloc[0]
         logger.info(f"正在处理资产: {code} ({asset_type})")
 
-        if asset_type == 'Stock':
+        if asset_type == 'Stock' or asset_type == '证券' or asset_type == '基金':
             results = process_stock_transactions(group_df, code)
-        else:  # Option
+        else:  # Option/期权
             results = process_option_transactions(group_df, code)
         all_sales_records.extend(results)
 
@@ -381,7 +390,7 @@ def _create_summary_df(yearly_df: pd.DataFrame) -> pd.DataFrame:
     summary_df = yearly_df.groupby(['年份', '结算币种']).apply(summarize_currency).reset_index()
     return summary_df
 
-def generate_and_save_reports(report_df: pd.DataFrame, output_dir: str):
+def generate_and_save_reports(transactions_df: pd.DataFrame, report_df: pd.DataFrame, output_dir: str):
     """I/O与流程控制：按年份生成并保存报告，包含汇总信息。"""
     if report_df.empty:
         logger.info("没有发现任何可报告的卖出交易，未生成报告。")
@@ -400,7 +409,10 @@ def generate_and_save_reports(report_df: pd.DataFrame, output_dir: str):
         final_df.to_csv(output_filename, index=False, encoding='utf-8-sig', float_format='%.4f')
         logger.info("税务报告已保存至: %s", output_filename)
 
-
+    # 保存原始交易数据
+    output_filename = os.path.join(output_dir, "原始交易数据.csv")
+    transactions_df.to_csv(output_filename, index=False, encoding='utf-8-sig', float_format='%.4f')
+    logger.info("原始交易数据已保存至: %s", output_filename)
 # ==============================================================================
 # 主逻辑与执行入口
 # ==============================================================================
@@ -432,15 +444,15 @@ def calculate_tax(input_path: str, output_dir: str):
         input_dir = input_path if os.path.isdir(input_path) else os.path.dirname(input_path)
         transactions_df = _merge_rsu_data(transactions_df, input_dir)
 
-        # 3. 分类资产
-        transactions_df['资产类型'] = transactions_df['股票代码'].apply(classify_asset)
-        logger.info("数据加载和预处理完成。")
+        ## 3. 分类资产, 不需要，因为已经分类了
+        # transactions_df['资产类型'] = transactions_df['股票代码'].apply(classify_asset)
+        # logger.info("数据加载和预处理完成。")
 
         # 4. 计算所有交易
         all_sales_df = _process_all_transactions(transactions_df)
 
         # 5. 生成并保存报告
-        generate_and_save_reports(all_sales_df, output_dir)
+        generate_and_save_reports(transactions_df, all_sales_df, output_dir)
 
         logger.info("处理完成。")
 
