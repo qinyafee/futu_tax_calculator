@@ -212,45 +212,85 @@ def extract_expiration_date(option_code: str) -> Optional[str]:
 
 
 # ==============================================================================
-# 股票交易处理
+# 股票交易处理（含卖空）
 # ==============================================================================
 
+def _handle_stock_sell_to_close(holdings: Dict, row: Any, code: str) -> Tuple[Dict, Dict]:
+    """处理股票卖出平仓（多头平仓）。返回 (销售记录, 更新后的持仓)。"""
+    sell_quantity = min(row.数量, holdings['quantity'])
+    avg_cost = holdings['cost_basis'] / holdings['quantity']
+
+    profit = (row.成交价格 - avg_cost) * sell_quantity - row.合计手续费
+    record = create_sales_record(
+        code, row.成交价格, round(avg_cost, 4), sell_quantity, profit,
+        row.交易时间, row.结算币种
+    )
+
+    updated_holdings = holdings.copy()
+    updated_holdings['quantity'] -= sell_quantity
+    updated_holdings['cost_basis'] -= avg_cost * sell_quantity
+    return record, updated_holdings
+
+
+def _handle_stock_buy_to_close(holdings: Dict, row: Any, code: str) -> Tuple[Dict, Dict]:
+    """处理股票买入平仓（空头平仓）。返回 (销售记录, 更新后的持仓)。"""
+    close_quantity = min(row.数量, abs(holdings['quantity']))
+    avg_proceeds = holdings['short_proceeds'] / abs(holdings['quantity'])
+
+    # 卖空平仓盈亏 = 卖空收入 - 买入成本 - 手续费
+    profit = (avg_proceeds * close_quantity) - (row.成交价格 * close_quantity) - row.合计手续费
+    record = create_sales_record(
+        code, round(avg_proceeds, 4), row.成交价格, close_quantity, profit,
+        row.交易时间, row.结算币种, '卖空平仓'
+    )
+
+    updated_holdings = holdings.copy()
+    updated_holdings['quantity'] += close_quantity
+    updated_holdings['short_proceeds'] -= avg_proceeds * close_quantity
+    return record, updated_holdings
+
+
 def process_stock_transactions(df: pd.DataFrame, code: str) -> List[Dict[str, Any]]:
-    """处理单个股票的完整历史交易记录，使用移动平均加权算法。"""
-    holdings = {'quantity': 0, 'cost_basis': 0.0}
+    """处理单个股票的完整历史交易记录，使用移动平均加权算法，支持做多与卖空。"""
+    holdings = {'quantity': 0, 'cost_basis': 0.0, 'short_proceeds': 0.0}
     sales_records = []
 
     for row in df.itertuples(index=False):
+        qty, price, fee = row.数量, row.成交价格, row.合计手续费
+
         if is_buy(row):
-            holdings['quantity'] += row.数量
-            holdings['cost_basis'] += row.数量 * row.成交价格 + row.合计手续费
+            if holdings['quantity'] < 0:  # 存在空头仓位，买入平仓
+                record, holdings = _handle_stock_buy_to_close(holdings, row, code)
+                sales_records.append(record)
+                if qty > abs(record['数量']):  # 买入量大于平仓量，剩余部分开多仓
+                    open_qty = int(qty - abs(record['数量']))
+                    holdings['quantity'] += open_qty
+                    holdings['cost_basis'] += open_qty * price + fee
+            else:  # 买入开仓（做多）
+                holdings['quantity'] += qty
+                holdings['cost_basis'] += qty * price + fee
+
         elif is_sell(row):
-            if holdings['quantity'] == 0:
-                sales_records.append(create_sales_record(
-                    code, row.成交价格, 0, row.数量, 0, row.交易时间,
-                    row.结算币种, '卖出时无持仓, 需手动核查'
-                ))
-                continue
+            if holdings['quantity'] > 0:  # 存在多头仓位，卖出平仓
+                record, holdings = _handle_stock_sell_to_close(holdings, row, code)
+                sales_records.append(record)
+                if qty > record['数量']:  # 卖出量大于平仓量，剩余部分开空仓
+                    open_qty = int(qty - record['数量'])
+                    holdings['quantity'] -= open_qty
+                    holdings['short_proceeds'] += open_qty * price - fee
+            else:  # 卖出开仓（卖空）
+                holdings['quantity'] -= qty
+                holdings['short_proceeds'] += qty * price - fee
 
-            avg_cost = holdings['cost_basis'] / holdings['quantity']
-            sold_qty = min(row.数量, holdings['quantity'])
+    # 期末处理：未平仓的卖空头寸，生成需核查记录
+    if holdings['quantity'] < 0:
+        avg_proceeds = holdings['short_proceeds'] / abs(holdings['quantity'])
+        last_row = df.iloc[-1]
+        sales_records.append(create_sales_record(
+            code, round(avg_proceeds, 4), 0, abs(holdings['quantity']), 0,
+            last_row['交易时间'], last_row['结算币种'], '卖空未平仓, 需手动核查'
+        ))
 
-            profit = (row.成交价格 - avg_cost) * sold_qty - row.合计手续费
-            sales_records.append(create_sales_record(
-                code, row.成交价格, round(avg_cost, 4), sold_qty, profit,
-                row.交易时间, row.结算币种
-            ))
-
-            holdings['quantity'] -= sold_qty
-            holdings['cost_basis'] -= avg_cost * sold_qty
-
-            if row.数量 > sold_qty:
-                extra_qty = row.数量 - sold_qty
-                sales_records.append(create_sales_record(
-                    code, row.成交价格, 0, extra_qty, 0, row.交易时间,
-                    row.结算币种, '卖超持仓, 需手动核查'
-                ))
-                holdings = {'quantity': 0, 'cost_basis': 0.0}
     return sales_records
 
 
