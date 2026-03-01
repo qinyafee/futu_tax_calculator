@@ -30,6 +30,12 @@ DIRECTION_MAPPING = {
     'buy_back': 'buy',
     'buy': 'buy',
     'sell': 'sell',
+    # 公司行动（拆股/合股）
+    '拆股': 'split',
+    '合股': 'split',
+    'stock split': 'split',
+    'reverse split': 'split',
+    'split': 'split',
     # 做多交易
     '买入开仓': 'buy',
     '卖出平仓': 'sell',
@@ -154,7 +160,21 @@ def _clean_trading_data(df: pd.DataFrame) -> pd.DataFrame:
     cleaned_df['买卖方向'] = cleaned_df['买卖方向'].str.lower().str.strip().replace(DIRECTION_MAPPING)
 
     before_count = len(cleaned_df)
-    cleaned_df.dropna(subset=['数量', '成交价格', '合计手续费', '交易时间', '买卖方向'], inplace=True)
+    # 拆股/合股不一定有价格/手续费，允许为空（默认按0处理）
+    split_mask = cleaned_df['买卖方向'] == 'split'
+    if split_mask.any():
+        cleaned_df.loc[split_mask, ['成交价格', '合计手续费']] = cleaned_df.loc[
+            split_mask, ['成交价格', '合计手续费']
+        ].fillna(0)
+
+    # 对 buy/sell 强制要求价格和手续费存在；split 只要求数量/时间/方向等关键字段
+    base_required = cleaned_df['数量'].notna() & cleaned_df['交易时间'].notna() & cleaned_df['买卖方向'].notna()
+    base_required &= cleaned_df['股票代码'].notna() & cleaned_df['结算币种'].notna()
+    trade_required = cleaned_df['买卖方向'].isin(['buy', 'sell'])
+    buy_sell_has_price_fee = cleaned_df['成交价格'].notna() & cleaned_df['合计手续费'].notna()
+
+    valid_mask = base_required & (~trade_required | buy_sell_has_price_fee)
+    cleaned_df = cleaned_df.loc[valid_mask].copy()
     after_count = len(cleaned_df)
 
     if before_count > after_count:
@@ -178,6 +198,10 @@ def is_buy(row: pd.Series) -> bool:
 def is_sell(row: pd.Series) -> bool:
     """判断是否为卖出操作 (已标准化)。"""
     return row.买卖方向 == 'sell'
+
+def is_split(row: pd.Series) -> bool:
+    """判断是否为拆股/合股操作 (已标准化)。"""
+    return row.买卖方向 == 'split'
 
 def create_sales_record(
     code: str, sale_price: float, cost_price: float, quantity: int,
@@ -263,7 +287,7 @@ def process_stock_transactions(df: pd.DataFrame, code: str) -> List[Dict[str, An
                 record, holdings = _handle_stock_buy_to_close(holdings, row, code)
                 sales_records.append(record)
                 if qty > abs(record['数量']):  # 买入量大于平仓量，剩余部分开多仓
-                    open_qty = int(qty - abs(record['数量']))
+                    open_qty = qty - abs(record['数量'])
                     holdings['quantity'] += open_qty
                     holdings['cost_basis'] += open_qty * price + fee
             else:  # 买入开仓（做多）
@@ -275,12 +299,32 @@ def process_stock_transactions(df: pd.DataFrame, code: str) -> List[Dict[str, An
                 record, holdings = _handle_stock_sell_to_close(holdings, row, code)
                 sales_records.append(record)
                 if qty > record['数量']:  # 卖出量大于平仓量，剩余部分开空仓
-                    open_qty = int(qty - record['数量'])
+                    open_qty = qty - record['数量']
                     holdings['quantity'] -= open_qty
                     holdings['short_proceeds'] += open_qty * price - fee
             else:  # 卖出开仓（卖空）
                 holdings['quantity'] -= qty
                 holdings['short_proceeds'] += qty * price - fee
+
+        elif is_split(row):
+            if holdings['quantity'] == 0:
+                continue
+            if qty is None or qty == 0:
+                continue
+            if qty < 0:
+                logger.warning("检测到负拆合股参数，已忽略: %s %s %s", code, qty, row.交易时间)
+                continue
+
+            # 约定：split 行的 数量 优先作为“拆合股倍率”（如 2 表示 1拆2，0.5 表示 2合1）
+            # 兼容：若 qty 看起来像“拆合股后的持仓数量”，则用当前持仓推导倍率
+            factor = float(qty)
+            if factor > 20:
+                factor = float(qty) / abs(float(holdings['quantity']))
+
+            if factor <= 0:
+                continue
+
+            holdings['quantity'] = round(float(holdings['quantity']) * factor, 6)
 
     # 期末处理：未平仓的卖空头寸，生成需核查记录
     if holdings['quantity'] < 0:
